@@ -1,0 +1,35 @@
+{
+    "compilerOptions": {
+        "outDir": "dist",
+        "rootDir": "src",
+        "lib": [
+            "ESNext",
+            "dom"
+        ],
+        "module": "Preserve",
+        "moduleResolution": "Bundler",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": false,
+        "forceConsistentCasingInFileNames": false,
+        "allowImportingTsExtensions": true,
+        "declaration": true,
+        "emitDeclarationOnly": true,
+        "resolveJsonModule": true,
+        "noImplicitAny": false,
+        "allowJs": true,
+        "checkJs": false,
+        "noEmitOnError": false,
+        "noUnusedLocals": true,
+        "noUnusedParameters": false,
+        "typeRoots": [
+            "./types",
+            "./node_modules/@types"
+        ],
+        "moduleDetection": "force",
+        "allowArbitraryExtensions": true
+    },
+    "include": [
+        "src/**/*.ts"
+    ]
+}
