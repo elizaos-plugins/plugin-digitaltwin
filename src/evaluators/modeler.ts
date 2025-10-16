@@ -11,12 +11,13 @@ import {
   characterSchema,
 } from '@elizaos/core';
 import { v4 } from 'uuid';
+import JSON5 from 'json5';
 import { parseXml } from '../utils.ts';
 import { schemaToPrompt } from '../utils_zod.ts';
 
 const COMPONENT_TYPE_CHARACTER = 'CHARACTER'
 
-export async function askLlmObject(
+export async function askLlmObjectXml(
   runtime: IAgentRuntime,
   ask: Object,
   requiredFields: string[],
@@ -29,7 +30,7 @@ export async function askLlmObject(
 
   function checkRequired(resp) {
     if (!resp) {
-      console.log('No response')
+      console.log('askLlmObjectXml - No response')
       return false;
     }
     let hasAll = true;
@@ -44,7 +45,7 @@ export async function askLlmObject(
     return hasAll;
   }
   if (!ask.system) {
-    console.log('trader::utils:askLlmObject - Omitting system prompt')
+    runtime.logger.debug('askLlmObjectXml - Omitting system prompt')
   }
 
   let good = false;
@@ -59,11 +60,11 @@ export async function askLlmObject(
     });
 
     // too coarse but the only place to see <think>
-    console.log('trader::utils:askLlmObject - response', response);
+    console.log('askLlmObjectXml - response', response);
 
     // we do not need the backtic stuff .replace('```json', '').replace('```', '')
     let cleanResponse = response.replace(/<think>[\s\S]*?<\/think>/g, '')
-    responseContent = parseJSONObjectFromText(cleanResponse) as any;
+    responseContent = parseXml(cleanResponse) as any;
 
     retries++;
     good = checkRequired(responseContent);
@@ -90,7 +91,8 @@ export const modelerEvaluator: Evaluator = {
   },
   description: 'Model audience into digital twin characters',
   handler: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
-    console.log('digitalTwin:modeler')
+    const modelTarget = message.metadata.entityName
+    console.log('digitalTwin:modeler for', modelTarget)
 /*
 message {
   id: "93c62b4f-b9db-07a9-a39c-12f460a841bb",
@@ -129,11 +131,16 @@ message {
     if (!entity) {
       const success = await runtime.createEntity({
         id: entityId,
-        //names: [message.names],
+        //names: [message.names], // message.names isn't set on tg msgs
         //metadata: entityMetadata,
         agentId: runtime.agentId,
       });
       entity = await runtime.getEntityById(entityId);
+    }
+
+    const formattedName = entity?.names[0] || 'Unknown User';
+    if (formattedName !== modelTarget) {
+      runtime.logger.debug('weird entity name doesnt match message metadata', formattedName, message)
     }
 
     //const entities = await runtime.getEntitiesByIds([entityId])
@@ -230,16 +237,48 @@ entity {
     // adjust this character accordingly...
     // describe current character
     // ask about interaction to propose changes
+
+    const character = characterComp.data ?? {}
+
+    //state = await runtime.composeState(message, ['RECENT_MESSAGES']);
+    //console.log('state', state)
+
+    const conversationLength = runtime.getConversationLength(); // defaults to 32
+    const entitiesData = await getEntityDetails({ runtime, roomId })
+    const recentMessagesData = await runtime.getMemories({
+      tableName: 'messages',
+      roomId: message.roomId,
+      count: conversationLength,
+      unique: false,
+    })
+    const dialogueMessages = recentMessagesData.filter(
+      (msg) => !(msg.content?.type === 'action_result' && msg.metadata?.type === 'action_result')
+    );
+    const formattedRecentMessages = await formatMessages({
+      messages: dialogueMessages,
+      entities: entitiesData,
+    })
+
     const characterDescription = schemaToPrompt(characterSchema)
     const template = `
-<task>Review existing character file for user and recent conversation and see if we need to make any updates</task>
+<task>Review existing character file for ${modelTarget} with recent conversation and see if we need to make any updates</task>
+
+<instructions>
+- You are {{agentName}}, we are managing a character for ${modelTarget} in the messages
+- Don't say ${modelTarget} in the new value, it's already assumed
+- Be economical but useful, high utility for LLM prompts to utilize when either estimating what this user would say OR how another character would interact with this character (the goal being to improve interactions between the two)
+</instructions>
+
+<messages>
+${formattedRecentMessages}
+</messages>
 
 <character_structure>
 ${characterDescription}
 </character_structure>
 
 <character>
-{}
+${JSON.stringify(character)}
 </character>
 
 <output>
@@ -270,13 +309,52 @@ IMPORTANT: Your response must ONLY contain the <response></response> XML block a
       template,
     });
 
-    const response = await askLlmObject(runtime, {
+    const response = await askLlmObjectXml(runtime, {
      prompt,
     }, ['updates'])
-
-    console.log('modeler response', response)
-
+    if (!response || !response.updates.update) {
+      runtime.logger.warn('failed to extract updates for character, aborting modeling')
+      return
+    }
+    console.log('modeler response', response.updates.update.length)
     // make changes
+    if (Array.isArray(response.updates.update)) {
+      for(const u of response.updates.update) {
+        console.log('modeler u', u)
+        // skip if confidence less than 50?
+        const old = character[u.field] ?? ''
+        if (u.old === old || (u.old === '[]' && !old)) {
+          console.log('old matches for', u.field)
+        } else {
+          console.log('old doesnt matches', u.field, u.old, old)
+        }
+        // logging delta might really help in logging
+        // should we store confidence/weight values?
+        // attempt JSON5 parse of u.new
+        let obj
+        try {
+          obj = JSON5.parse(u.new)
+          console.log('parsed', obj)
+        } catch(e) {
+          console.log('not json', u.new, e)
+          obj = undefined
+        }
+        character[u.field] = obj ?? u.new
+        // check to see if it passes the zod check?
+        // revert to old if not...?
+      }
+    } else if (response.updates.update) {
+      // process single?
+      console.log('single', response.updates)
+    } else {
+      console.log('no update?', response.updates)
+    }
+    console.log('new character', character)
+    // save back to our entity component
+    await runtime.updateComponent({
+      id: characterComp.id,
+      data: character,
+    });
   },
   examples: [],
 }
