@@ -1,77 +1,39 @@
 import { z, ZodTypeAny, ZodObject } from "zod";
 
-/** Unwrap common wrappers so we can see the underlying type */
-function unwrap(t: ZodTypeAny): ZodTypeAny {
-  // Peel off Optional/Nullable/Default/Effects/Branded/Readonly/Catch, etc.
-  // Uses minimal private fields where needed; fine for tooling.
-  // Loop until stable.
+// Narrowly checks if something looks like a Zod schema
+function isZodSchema(x: any): x is ZodTypeAny {
+  return !!x && typeof x === "object" && x._def && typeof x._def.typeName === "string";
+}
+
+// Unwrap common wrappers so we can see the underlying type
+function unwrap(t: any): ZodTypeAny | undefined {
+  if (!isZodSchema(t)) return undefined;
+
+  // Loop but bail out if structure isn't as expected
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    // @ts-expect-error private access
-    const def = t?._def;
-    if (!def) break;
+    if (!isZodSchema(t)) return undefined;
+    const d: any = t._def;
+    if (!d) return t;
 
-    if (t.isOptional?.()) { t = def.innerType; continue; }
-    // nullable, default
-    if (def?.innerType) { t = def.innerType; continue; }
-    // effects(schema)
-    if (def?.schema) { t = def.schema; continue; }
-    // branded/readonly/catch/pipeline(type)
-    if (def?.type) { t = def.type; continue; }
+    // Optional/Nullable have .innerType
+    if (typeof (t as any).isOptional === "function" && (t as any).isOptional()) { t = d.innerType; continue; }
+    if ("innerType" in d && isZodSchema(d.innerType)) { t = d.innerType; continue; }
 
-    break;
+    // Effects wrap .schema, branded/readonly/pipeline/catch wrap .type
+    if ("schema" in d && isZodSchema(d.schema)) { t = d.schema; continue; }
+    if ("type" in d && isZodSchema(d.type)) { t = d.type; continue; }
+
+    return t;
   }
-  return t;
 }
 
-/*
-function typeToString(t: ZodTypeAny): string {
-  t = unwrap(t);
+function typeToString(t0: any): string {
+  const t = unwrap(t0);
+  if (!isZodSchema(t)) return "unknown";
 
-  if (t instanceof z.ZodString) return "string";
-  if (t instanceof z.ZodNumber) return "number";
-  if (t instanceof z.ZodBoolean) return "boolean";
-  if (t instanceof z.ZodDate) return "date";
-  if (t instanceof z.ZodBigInt) return "bigint";
-  if (t instanceof z.ZodLiteral) return JSON.stringify(t.value);
-  if (t instanceof z.ZodEnum) return `enum<${t._def.values.join(" | ")}>`;
-  if (t instanceof z.ZodNativeEnum) return "enum";
-  if (t instanceof z.ZodArray) {
-    // @ts-expect-error private
-    const elem = t._def.type as ZodTypeAny;
-    return `array<${typeToString(elem)}>`;
-  }
-  if (t instanceof z.ZodRecord) {
-    // @ts-expect-error private
-    const valueType = t._def.valueType as ZodTypeAny;
-    return `record<string, ${typeToString(valueType)}>`;
-  }
-  if (t instanceof z.ZodUnion) {
-    // @ts-expect-error private
-    const options = t._def.options as ZodTypeAny[];
-    return options.map(typeToString).join(" | ");
-  }
-  if (t instanceof z.ZodDiscriminatedUnion) {
-    // @ts-expect-error private
-    const options = [...t._def.options.values()] as ZodTypeAny[];
-    return options.map(typeToString).join(" | ");
-  }
-  if (t instanceof z.ZodObject) return "object";
-  if (t instanceof z.ZodTuple) return "tuple";
-  if (t instanceof z.ZodUnknown) return "unknown";
-  if (t instanceof z.ZodAny) return "any";
-  if (t instanceof z.ZodNull) return "null";
-  if (t instanceof z.ZodUndefined) return "undefined";
-
-  return "unknown";
-}
-*/
-
-function typeToString(t: ZodTypeAny): string {
-  t = unwrap(t);
-  // @ts-expect-error private
-  const def = t._def ?? {};
-  const kind: string = def.typeName; // like "ZodString", "ZodArray", ...
+  const def: any = t._def || {};
+  const kind: string = def.typeName;
 
   switch (kind) {
     case "ZodString": return "string";
@@ -80,34 +42,64 @@ function typeToString(t: ZodTypeAny): string {
     case "ZodDate": return "date";
     case "ZodBigInt": return "bigint";
     case "ZodLiteral": return JSON.stringify(def.value);
-    case "ZodEnum": return `enum<${(def.values as string[]).join(" | ")}>`;
+    case "ZodEnum": return `enum<${Array.isArray(def.values) ? def.values.join(" | ") : ""}>`;
     case "ZodNativeEnum": return "enum";
     case "ZodNull": return "null";
     case "ZodUndefined": return "undefined";
     case "ZodUnknown": return "unknown";
     case "ZodAny": return "any";
+
     case "ZodArray": {
-      const elem = def.type as z.ZodTypeAny;
-      return `array<${typeToString(elem)}>`;
+      const elem = def.type;
+      return `array<${isZodSchema(elem) ? typeToString(elem) : "unknown"}>`;
     }
+
     case "ZodRecord": {
-      const valueType = def.valueType as z.ZodTypeAny;
-      return `record<string, ${typeToString(valueType)}>`;
+      const valueType = def.valueType;
+      return `record<string, ${isZodSchema(valueType) ? typeToString(valueType) : "unknown"}>`;
     }
+
     case "ZodUnion": {
-      const options = def.options as z.ZodTypeAny[];
-      return options.map(typeToString).join(" | ");
+      const options: any[] = Array.isArray(def.options) ? def.options : [];
+      return options.map(o => (isZodSchema(o) ? typeToString(o) : "unknown")).join(" | ");
     }
+
     case "ZodDiscriminatedUnion": {
-      const options = Array.from((def.options as Map<any, any>).values()) as z.ZodTypeAny[];
-      return options.map(typeToString).join(" | ");
+      const optMap: Map<any, any> | undefined = def.options;
+      const options = optMap ? Array.from(optMap.values()) : [];
+      return options.map(o => (isZodSchema(o) ? typeToString(o) : "unknown")).join(" | ");
     }
+
     case "ZodObject": return "object";
-    case "ZodTuple": return "tuple";
+    //case "ZodTuple": return "tuple";
+    case "ZodTuple": {
+      const items = (def.items ?? []).map((i: any) => isZodSchema(i) ? typeToString(i) : "unknown");
+      return `tuple<${items.join(", ")}>`;
+    }
+
     default: return "unknown";
   }
 }
 
+// Safe meta/description pull
+function getDescription(s: any): string | undefined {
+  if (isZodSchema(s) && typeof (s as any).meta === "function") {
+    const m = (s as any).meta();
+    if (m?.description) return m.description;
+  }
+  // Fallback to private def (older Zod)
+  if (isZodSchema(s) && s._def?.description) return s._def.description;
+  // Try unwrapped
+  const u = unwrap(s);
+  if (u && typeof (u as any).meta === "function") {
+    const m = (u as any).meta();
+    if (m?.description) return m.description;
+  }
+  if (u?._def?.description) return u._def.description;
+  return undefined;
+}
+
+/*
 type FieldInfo = {
   path: string;          // e.g., "templates", "knowledge[].source"
   type: string;          // e.g., "string", "array<string>", "record<string, ...>"
@@ -125,58 +117,58 @@ function fieldDescription(t: ZodTypeAny): string | undefined {
       // @ts-expect-error private
       || unwrap(t)._def?.description;
 }
+*/
 
-function collectFields(
-  schema: ZodObject<any>,
-  prefix = ""
-): FieldInfo[] {
-  const out: FieldInfo[] = [];
-  const shape = schema.shape;
+// Collect fields safely from a Zod object schema
+function collectFields(schema: any, prefix = ""): Array<{
+  path: string;
+  type: string;
+  optional: boolean;
+  description?: string;
+}> {
+  const out: any[] = [];
+  const obj = unwrap(schema);
+  if (!isZodSchema(obj) || obj._def?.typeName !== "ZodObject") return out;
 
+  const shape = (obj as z.ZodObject<any>).shape;
   for (const key of Object.keys(shape)) {
-    const original = shape[key] as ZodTypeAny;
-    const unwrapped = unwrap(original);
+    const original: any = (shape as any)[key];
     const path = prefix ? `${prefix}.${key}` : key;
+    const unwrapped = unwrap(original);
 
-    const info: FieldInfo = {
-      path,
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-      optional: original.isOptional?.() === true,
-      type: typeToString(unwrapped),
-      description: fieldDescription(original),
-    };
+    const optional = !!(original && typeof original.isOptional === "function" && original.isOptional());
+    const description = getDescription(original);
+    const typeStr = typeToString(original);
 
-    if (unwrapped instanceof z.ZodObject) {
-      out.push(info); // include the parent node (object) summary
-      out.push(...collectFields(unwrapped, path)); // and recurse into children
-    } else {
-      out.push(info);
+    out.push({ path, type: typeStr, optional, description });
+
+    // Recurse into nested object/array-of-object/record-of-object if desired
+    if (isZodSchema(unwrapped) && unwrapped._def?.typeName === "ZodObject") {
+      out.push(...collectFields(unwrapped, path));
+    } else if (isZodSchema(unwrapped) && unwrapped._def?.typeName === "ZodArray") {
+      const elem = unwrap(unwrapped._def?.type);
+      if (isZodSchema(elem) && elem._def?.typeName === "ZodObject") {
+        out.push(...collectFields(elem, `${path}[]`));
+      }
+    } else if (isZodSchema(unwrapped) && unwrapped._def?.typeName === "ZodRecord") {
+      const val = unwrap(unwrapped._def?.valueType);
+      if (isZodSchema(val) && val._def?.typeName === "ZodObject") {
+        out.push(...collectFields(val, `${path}{value}`));
+      }
     }
   }
-
   return out;
 }
 
-/** Turn a Zod object schema into a prompt-friendly text block */
-export function schemaToPrompt(schema: ZodObject<any>): string {
-  const lines: string[] = [];
-  const desc =
-    schema.meta?.()?.description
-    // @ts-expect-error private (older Zod)
-    || schema._def?.description;
-
-  if (desc) {
-    lines.push(`Schema: ${desc}`);
-  } else {
-    lines.push("Schema:");
-  }
-
+/** Turn a Zod object schema into text for LLM prompts */
+export function schemaToPrompt(schema: any): string {
+  const desc = getDescription(schema);
+  const lines = [desc ? `Schema: ${desc}` : "Schema:"];
   const fields = collectFields(schema);
   for (const f of fields) {
     const opt = f.optional ? "optional" : "required";
-    const descPart = f.description ? ` — ${f.description}` : "";
-    lines.push(`- ${f.path} (${f.type}, ${opt})${descPart}`);
+    const d = f.description ? ` — ${f.description}` : "";
+    lines.push(`- ${f.path} (${f.type}, ${opt})${d}`);
   }
-
   return lines.join("\n");
 }
