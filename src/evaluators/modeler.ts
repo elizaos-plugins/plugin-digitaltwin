@@ -9,6 +9,7 @@ import {
   composePromptFromState,
   asUUID,
   characterSchema,
+  stringToUuid
 } from '@elizaos/core';
 import { v4 } from 'uuid';
 import JSON5 from 'json5';
@@ -140,7 +141,7 @@ message {
 
     const formattedName = entity?.names[0] || 'Unknown User';
     if (formattedName !== modelTarget) {
-      runtime.logger.debug('weird entity name doesnt match message metadata', formattedName, message)
+      runtime.logger.debug('modeler - weird entity name doesnt match message metadata', formattedName, message)
     }
 
     //const entities = await runtime.getEntitiesByIds([entityId])
@@ -233,7 +234,7 @@ entity {
       createdAt: 1760567005000,
     }
     */
-    console.log('characterComp', characterComp)
+    //console.log('modeler - characterComp', characterComp)
     // adjust this character accordingly...
     // describe current character
     // ask about interaction to propose changes
@@ -263,12 +264,6 @@ entity {
     const template = `
 <task>Review existing character file for ${modelTarget} with recent conversation and see if we need to make any updates</task>
 
-<instructions>
-- You are {{agentName}}, we are managing a character for ${modelTarget} in the messages
-- Don't say ${modelTarget} in the new value, it's already assumed
-- Be economical but useful, high utility for LLM prompts to utilize when either estimating what this user would say OR how another character would interact with this character (the goal being to improve interactions between the two)
-</instructions>
-
 <messages>
 ${formattedRecentMessages}
 </messages>
@@ -277,8 +272,15 @@ ${formattedRecentMessages}
 ${characterDescription}
 </character_structure>
 
+<instructions>
+- You are {{agentName}}, we are managing a character for ${modelTarget} in the messages
+- Don't say ${modelTarget} in the new value, it's already assumed
+- Be economical but useful, high utility for LLM prompts to utilize when either estimating what this user would say OR how another character would interact with this character (the goal being to improve interactions between the two)
+- system and message examples are important ensure we have data for them
+</instructions>
+
 <character>
-${JSON.stringify(character)}
+${JSON.stringify(character, null, 2)}
 </character>
 
 <output>
@@ -296,6 +298,7 @@ Respond using XML format like this:
       <weight>0-100 how important this change is to capture this users personality</weight>
       <new>new value</new>
       <old>old value</old>
+      <difference>Explains whats changed in the new value from the old value</difference>
     </update>
     <!-- Add more updates as needed -->
   </updates>
@@ -316,40 +319,48 @@ IMPORTANT: Your response must ONLY contain the <response></response> XML block a
       runtime.logger.warn('failed to extract updates for character, aborting modeling')
       return
     }
-    console.log('modeler response', response.updates.update.length)
+
+    function doUpdate(u) {
+      console.log('modeler u', u)
+      // skip if confidence less than 50?
+      const old = character[u.field] ?? ''
+      if (u.old === old || (u.old === '[]' && !old)) {
+        console.log('old matches for', u.field)
+      } else {
+        console.log('old doesnt match', u.field, u.old, old)
+      }
+      // logging delta might really help in logging
+      // should we store confidence/weight values?
+      // attempt JSON5 parse of u.new
+      let obj
+      try {
+        obj = JSON5.parse(u.new)
+        console.log('modeler - parsed', obj)
+      } catch(e) {
+        console.log('modeler - not json', u.new, e)
+        obj = undefined
+      }
+      character[u.field] = obj ?? u.new
+      // check to see if it passes the zod check?
+      // revert to old if not...?
+    }
+
     // make changes
     if (Array.isArray(response.updates.update)) {
+      console.log('modeler - updates', response.updates.update.length)
       for(const u of response.updates.update) {
-        console.log('modeler u', u)
-        // skip if confidence less than 50?
-        const old = character[u.field] ?? ''
-        if (u.old === old || (u.old === '[]' && !old)) {
-          console.log('old matches for', u.field)
-        } else {
-          console.log('old doesnt matches', u.field, u.old, old)
-        }
-        // logging delta might really help in logging
-        // should we store confidence/weight values?
-        // attempt JSON5 parse of u.new
-        let obj
-        try {
-          obj = JSON5.parse(u.new)
-          console.log('parsed', obj)
-        } catch(e) {
-          console.log('not json', u.new, e)
-          obj = undefined
-        }
-        character[u.field] = obj ?? u.new
-        // check to see if it passes the zod check?
-        // revert to old if not...?
+        doUpdate(u)
       }
     } else if (response.updates.update) {
       // process single?
-      console.log('single', response.updates)
+      console.log('modeler - single', response.updates)
+      doUpdate(response.updates.update)
     } else {
-      console.log('no update?', response.updates)
+      console.log('modeler - no update?', response.updates)
     }
-    console.log('new character', character)
+    character.name = modelTarget
+    character.id = stringToUuid(character.name)
+    console.log('modeler - new character', character)
     // save back to our entity component
     await runtime.updateComponent({
       id: characterComp.id,
