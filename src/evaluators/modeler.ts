@@ -53,11 +53,8 @@ export async function askLlmObjectXml(
   while (retries < maxRetries && !good) {
     const response = await runtime.useModel(ModelType.TEXT_LARGE, {
       ...ask, // prompt, system
-      /*
       temperature: 0.2,
-      maxTokens: 4096,
-      object: true,
-      */
+      maxTokens: 16384, // Increased to prevent XML truncation
     });
 
     // too coarse but the only place to see <think>
@@ -70,7 +67,7 @@ export async function askLlmObjectXml(
     retries++;
     good = checkRequired(responseContent);
     if (!good) {
-      logger.warn(
+      runtime.logger.warn(
         '*** Missing required fields',
         responseContent,
         'needs',
@@ -92,31 +89,35 @@ export const modelerEvaluator: Evaluator = {
   },
   description: 'Model audience into digital twin characters',
   handler: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
+    if (!message.metadata) {
+      runtime.logger.debug('MODEL_ENTITY - message has no metadata, skipping')
+      return
+    }
     const modelTarget = message.metadata.entityName
     console.log('digitalTwin:modeler for', modelTarget)
-/*
-message {
-  id: "93c62b4f-b9db-07a9-a39c-12f460a841bb",
-  entityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-  agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-  roomId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-  content: {
-    text: "lets chat",
-    source: "telegram",
-    channelType: "DM",
-    inReplyTo: undefined,
-  },
-  metadata: {
-    entityName: "Vector0",
-    entityUserName: "VectorZer0",
-    fromBot: false,
-    fromId: 418984751,
-    sourceId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-    type: "message",
-  },
-  createdAt: 1760566998000,
-}
-*/
+    /*
+    message {
+      id: "93c62b4f-b9db-07a9-a39c-12f460a841bb",
+      entityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
+      agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
+      roomId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
+      content: {
+        text: "lets chat",
+        source: "telegram",
+        channelType: "DM",
+        inReplyTo: undefined,
+      },
+      metadata: {
+        entityName: "Vector0",
+        entityUserName: "VectorZer0",
+        fromBot: false,
+        fromId: 418984751,
+        sourceId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
+        type: "message",
+      },
+      createdAt: 1760566998000,
+    }
+    */
     const { roomId } = message;
     //console.log('message', message)
 
@@ -313,7 +314,7 @@ IMPORTANT: Your response must ONLY contain the <response></response> XML block a
     });
 
     const response = await askLlmObjectXml(runtime, {
-     prompt,
+      prompt,
     }, ['updates'])
     if (!response || !response.updates.update) {
       runtime.logger.warn('failed to extract updates for character, aborting modeling')
@@ -336,7 +337,7 @@ IMPORTANT: Your response must ONLY contain the <response></response> XML block a
       try {
         obj = JSON5.parse(u.new)
         console.log('modeler - parsed', obj)
-      } catch(e) {
+      } catch (e) {
         console.log('modeler - not json', u.new, e)
         obj = undefined
       }
@@ -348,7 +349,7 @@ IMPORTANT: Your response must ONLY contain the <response></response> XML block a
     // make changes
     if (Array.isArray(response.updates.update)) {
       console.log('modeler - updates', response.updates.update.length)
-      for(const u of response.updates.update) {
+      for (const u of response.updates.update) {
         doUpdate(u)
       }
     } else if (response.updates.update) {
@@ -364,6 +365,13 @@ IMPORTANT: Your response must ONLY contain the <response></response> XML block a
     // save back to our entity component
     await runtime.updateComponent({
       id: characterComp.id,
+      entityId: characterComp.entityId,
+      agentId: characterComp.agentId,
+      roomId: characterComp.roomId,
+      worldId: characterComp.worldId,
+      sourceEntityId: characterComp.sourceEntityId,
+      type: characterComp.type,
+      createdAt: characterComp.createdAt,
       data: character,
     });
   },
