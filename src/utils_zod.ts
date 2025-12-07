@@ -1,4 +1,4 @@
-import { z, ZodTypeAny, ZodObject } from "zod";
+import { z, type ZodTypeAny } from "zod";
 
 // Narrowly checks if something looks like a Zod schema
 function isZodSchema(x: any): x is ZodTypeAny {
@@ -28,11 +28,15 @@ function unwrap(t: any): ZodTypeAny | undefined {
   }
 }
 
+function getDef(schema: ZodTypeAny | undefined): any {
+  return schema ? (schema as unknown as { _def?: Record<string, unknown> })._def ?? {} : {};
+}
+
 function typeToString(t0: any): string {
   const t = unwrap(t0);
   if (!isZodSchema(t)) return "unknown";
 
-  const def: any = t._def || {};
+  const def: any = getDef(t);
   const kind: string = def.typeName;
 
   switch (kind) {
@@ -88,14 +92,16 @@ function getDescription(s: any): string | undefined {
     if (m?.description) return m.description;
   }
   // Fallback to private def (older Zod)
-  if (isZodSchema(s) && s._def?.description) return s._def.description;
+  const def = getDef(s);
+  if (def?.description) return def.description as string | undefined;
   // Try unwrapped
   const u = unwrap(s);
   if (u && typeof (u as any).meta === "function") {
     const m = (u as any).meta();
     if (m?.description) return m.description;
   }
-  if (u?._def?.description) return u._def.description;
+  const uDef = getDef(u);
+  if (uDef?.description) return uDef.description as string | undefined;
   return undefined;
 }
 
@@ -128,7 +134,8 @@ function collectFields(schema: any, prefix = ""): Array<{
 }> {
   const out: any[] = [];
   const obj = unwrap(schema);
-  if (!isZodSchema(obj) || obj._def?.typeName !== "ZodObject") return out;
+  const objDef = getDef(obj);
+  if (!isZodSchema(obj) || objDef?.typeName !== "ZodObject") return out;
 
   const shape = (obj as z.ZodObject<any>).shape;
   for (const key of Object.keys(shape)) {
@@ -143,16 +150,19 @@ function collectFields(schema: any, prefix = ""): Array<{
     out.push({ path, type: typeStr, optional, description });
 
     // Recurse into nested object/array-of-object/record-of-object if desired
-    if (isZodSchema(unwrapped) && unwrapped._def?.typeName === "ZodObject") {
+    const unwrappedDef = getDef(unwrapped);
+    if (isZodSchema(unwrapped) && unwrappedDef?.typeName === "ZodObject") {
       out.push(...collectFields(unwrapped, path));
-    } else if (isZodSchema(unwrapped) && unwrapped._def?.typeName === "ZodArray") {
-      const elem = unwrap(unwrapped._def?.type);
-      if (isZodSchema(elem) && elem._def?.typeName === "ZodObject") {
+    } else if (isZodSchema(unwrapped) && unwrappedDef?.typeName === "ZodArray") {
+      const elem = unwrap(unwrappedDef?.type);
+      const elemDef = getDef(elem);
+      if (isZodSchema(elem) && elemDef?.typeName === "ZodObject") {
         out.push(...collectFields(elem, `${path}[]`));
       }
-    } else if (isZodSchema(unwrapped) && unwrapped._def?.typeName === "ZodRecord") {
-      const val = unwrap(unwrapped._def?.valueType);
-      if (isZodSchema(val) && val._def?.typeName === "ZodObject") {
+    } else if (isZodSchema(unwrapped) && unwrappedDef?.typeName === "ZodRecord") {
+      const val = unwrap(unwrappedDef?.valueType);
+      const valDef = getDef(val);
+      if (isZodSchema(val) && valDef?.typeName === "ZodObject") {
         out.push(...collectFields(val, `${path}{value}`));
       }
     }
