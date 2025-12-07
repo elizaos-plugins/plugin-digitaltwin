@@ -1,82 +1,130 @@
 import {
+  type Component,
   type Evaluator,
+  formatMessages,
+  getEntityDetails,
   type IAgentRuntime,
   type Memory,
-  type State,
-  getEntityDetails,
-  formatMessages,
+  type MemoryMetadata,
   ModelType,
-  composePromptFromState,
+  type State,
   asUUID,
+  composePromptFromState,
   characterSchema,
   stringToUuid
 } from '@elizaos/core';
-import { v4 } from 'uuid';
+import { v4 as uuidv4 } from 'uuid';
 import JSON5 from 'json5';
 import { parseXml } from '../utils.ts';
 import { schemaToPrompt } from '../utils_zod.ts';
 
-const COMPONENT_TYPE_CHARACTER = 'CHARACTER'
+const COMPONENT_TYPE_CHARACTER = 'CHARACTER';
+const LOG_SCOPE = 'digitalTwin:modeler';
+
+type AskLlmObjectXmlParams = {
+  prompt: string;
+  system?: string;
+  temperature?: number;
+  maxTokens?: number;
+};
+
+type CharacterUpdate = {
+  field?: string;
+  reason?: string;
+  confidence?: string | number;
+  weight?: string | number;
+  new?: string;
+  old?: string;
+  difference?: string;
+};
+
+type XmlResponse = {
+  updates?: {
+    update?: CharacterUpdate | CharacterUpdate[];
+  };
+  userResponse?: string;
+  userResponseReason?: string;
+  userResponseConfidence?: string | number;
+  userResponseMissingInfo?: string;
+};
+
+type CharacterMetadata = Record<string, unknown> & {
+  id?: string;
+  name?: string;
+};
+
+type MessageMetadataWithEntity = MemoryMetadata & {
+  entityName?: string;
+  entityUserName?: string;
+};
+
+function asCharacterMetadata(data: unknown): CharacterMetadata {
+  if (data && typeof data === 'object') {
+    return data as CharacterMetadata;
+  }
+  return {};
+}
+
+function isMessageMetadataWithEntity(
+  metadata: MemoryMetadata | undefined
+): metadata is MessageMetadataWithEntity {
+  if (!metadata || typeof metadata !== 'object') return false;
+  const candidate = metadata as MessageMetadataWithEntity;
+  return typeof candidate.entityName === 'string' || typeof candidate.entityUserName === 'string';
+}
 
 export async function askLlmObjectXml(
   runtime: IAgentRuntime,
-  ask: Object,
+  ask: AskLlmObjectXmlParams,
   requiredFields: string[],
   maxRetries = 3
-) {
-  //console.log('using askLlmObject')
-  let responseContent: any | null = null;
-  // Retry if missing required fields
+): Promise<XmlResponse | null> {
+  let responseContent: XmlResponse | null = null;
   let retries = 0;
 
-  function checkRequired(resp) {
+  const checkRequired = (resp: XmlResponse | null): boolean => {
     if (!resp) {
-      console.log('askLlmObjectXml - No response')
+      runtime.logger.warn({ scope: LOG_SCOPE }, 'askLlmObjectXml received empty response');
       return false;
     }
-    let hasAll = true;
-    for (const f of requiredFields) {
-      // allow nulls
-      if (resp[f] === undefined) {
-        console.log('resp is missing', f, resp[f], resp)
-        hasAll = false;
-        break;
-      }
-    }
-    return hasAll;
-  }
+    return requiredFields.every((field) => (resp as Record<string, unknown>)[field] !== undefined);
+  };
+
   if (!ask.system) {
-    runtime.logger.debug('askLlmObjectXml - Omitting system prompt')
+    runtime.logger.debug({ scope: LOG_SCOPE }, 'askLlmObjectXml omitting system prompt');
   }
 
-  let good = false;
-  while (retries < maxRetries && !good) {
+  let satisfied = false;
+  while (retries < maxRetries && !satisfied) {
     const response = await runtime.useModel(ModelType.TEXT_LARGE, {
       ...ask, // prompt, system
       temperature: 0.2,
       maxTokens: 16384, // Increased to prevent XML truncation
     });
 
-    // too coarse but the only place to see <think>
-    console.log('askLlmObjectXml - response', response);
+    runtime.logger.debug({ scope: LOG_SCOPE, response }, 'askLlmObjectXml raw response');
 
-    // we do not need the backtic stuff .replace('```json', '').replace('```', '')
-    let cleanResponse = response.replace(/<think>[\s\S]*?<\/think>/g, '')
-    responseContent = parseXml(cleanResponse) as any;
+    const cleanResponse =
+      typeof response === 'string'
+        ? response.replace(/<think>[\s\S]*?<\/think>/g, '')
+        : '';
 
     retries++;
-    good = checkRequired(responseContent);
-    if (!good) {
+    responseContent = parseXml(cleanResponse) as XmlResponse | null;
+
+    satisfied = checkRequired(responseContent);
+    if (!satisfied) {
       runtime.logger.warn(
-        '*** Missing required fields',
-        responseContent,
-        'needs',
-        requiredFields,
-        ', retrying... ***'
+        {
+          scope: LOG_SCOPE,
+          response: responseContent,
+          requiredFields,
+        },
+        'askLlmObjectXml missing required fields'
       );
     }
   }
-  // can run null
+
   return responseContent;
 }
 
@@ -84,184 +132,177 @@ export const modelerEvaluator: Evaluator = {
   name: 'MODEL_ENTITY',
   similes: [],
   validate: async (runtime: IAgentRuntime, message: Memory): Promise<boolean> => {
-    // maybe we run once every 25-32 messages?
-    return true
+    runtime.logger.debug(
+      {
+        scope: LOG_SCOPE,
+        entityId: message.entityId,
+        roomId: message.roomId,
+        metadata: message.metadata,
+      },
+      'validate'
+    );
+    return true;
   },
   description: 'Model audience into digital twin characters',
   handler: async (runtime: IAgentRuntime, message: Memory, state?: State) => {
-    if (!message.metadata) {
-      runtime.logger.debug('MODEL_ENTITY - message has no metadata, skipping')
-      return
+    const metadata = message.metadata;
+    if (!metadata || !isMessageMetadataWithEntity(metadata)) {
+      runtime.logger.warn(
+        {
+          scope: LOG_SCOPE,
+          metadata,
+          messageId: message.id,
+        },
+        'message has no entity metadata'
+      );
+      return;
     }
-    const modelTarget = message.metadata.entityName
-    console.log('digitalTwin:modeler for', modelTarget)
-    /*
-    message {
-      id: "93c62b4f-b9db-07a9-a39c-12f460a841bb",
-      entityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-      roomId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      content: {
-        text: "lets chat",
-        source: "telegram",
-        channelType: "DM",
-        inReplyTo: undefined,
-      },
-      metadata: {
-        entityName: "Vector0",
-        entityUserName: "VectorZer0",
-        fromBot: false,
-        fromId: 418984751,
-        sourceId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-        type: "message",
-      },
-      createdAt: 1760566998000,
+
+    const entityId = metadata.sourceId;
+    if (!entityId) {
+      runtime.logger.warn(
+        {
+          scope: LOG_SCOPE,
+          metadata,
+          messageId: message.id,
+        },
+        'message metadata missing sourceId'
+      );
+      return;
     }
-    */
+
+    const modelTarget = metadata.entityName ?? metadata.entityUserName ?? 'Unknown User';
+    runtime.logger.debug(
+      {
+        scope: LOG_SCOPE,
+        modelTarget,
+        entityId,
+      },
+      'modeling entity'
+    );
+
     const { roomId } = message;
-    //console.log('message', message)
 
-    const uniqId = message?.metadata?.sourceId
-    if (!uniqId) {
-      runtime.logger.log('message has no identity')
-      return
-    }
-
-    // get current modeled entity
-    const entityId = message.metadata.sourceId
     let entity = await runtime.getEntityById(entityId);
     if (!entity) {
-      const success = await runtime.createEntity({
+      const created = await runtime.createEntity({
         id: entityId,
-        //names: [message.names], // message.names isn't set on tg msgs
-        //metadata: entityMetadata,
+        names: [modelTarget],
+        metadata: {},
         agentId: runtime.agentId,
       });
+      if (!created) {
+        runtime.logger.error(
+          {
+            scope: LOG_SCOPE,
+            entityId,
+          },
+          'failed to create entity'
+        );
+        return;
+      }
       entity = await runtime.getEntityById(entityId);
+      if (!entity) {
+        runtime.logger.error(
+          {
+            scope: LOG_SCOPE,
+            entityId,
+          },
+          'unable to fetch entity after creation'
+        );
+        return;
+      }
     }
 
-    const formattedName = entity?.names[0] || 'Unknown User';
+    const formattedName = entity.names[0] ?? modelTarget;
     if (formattedName !== modelTarget) {
-      runtime.logger.debug('modeler - weird entity name doesnt match message metadata', formattedName, message)
+      runtime.logger.debug(
+        {
+          scope: LOG_SCOPE,
+          formattedName,
+          modelTarget,
+        },
+        'entity name mismatch'
+      );
     }
 
-    //const entities = await runtime.getEntitiesByIds([entityId])
-    //const entity = entities[entityId]
+    let characterComp: Component | undefined =
+      entity.components?.find((component) => component.type === COMPONENT_TYPE_CHARACTER);
 
-    //console.log('entity', entity)
-    /*
-entity {
-  id: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-  agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-  createdAt: 1750790439000,
-  names: [ "Vector0", "VectorZer0" ],
-  metadata: {
-    telegram: {
-      name: "Vector0",
-      userName: "VectorZer0",
-    },
-  },
-  components: [
-    {
-      id: "0ba888b5-bfdc-06e0-a69c-bb1dfcaccc48",
-      entityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-      roomId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      worldId: "e0151a63-542b-0388-a2f0-86f87e1600ac",
-      sourceEntityId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-      type: "trust_profile",
-      data: [Object ...],
-      createdAt: 1757377065000,
-    }, {
-      id: "858d3281-cb48-4fc2-9d21-02d0cc13e0fa",
-      entityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-      roomId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      worldId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      sourceEntityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      type: "component_user_v0",
-      data: [Object ...],
-      createdAt: 1754526490000,
-    }
-  ],
-}
-    */
-    /*
-    const conversationLength = runtime.getConversationLength(); // defaults to 32
-    const hypos = await runtime.getMemories({
-      tableName: 'hypotheses', // prefix this with neuro_
-      //roomId,
-      //count: conversationLength,
-      unique: false,
-    })
-    const entitiesData = await getEntityDetails({ runtime, roomId })
-    */
-    //console.log('neuro:convo:handler - convos', convos)
-
-    let characterComp = entity.components.find(c => c.type === COMPONENT_TYPE_CHARACTER)
-    // ensure comp
     if (!characterComp) {
       const roomDetails = await runtime.getRoom(message.roomId);
-      const res: boolean = await runtime.createComponent({
-        id: v4() as UUID,
+      if (!roomDetails?.worldId) {
+        runtime.logger.warn(
+          {
+            scope: LOG_SCOPE,
+            roomId: message.roomId,
+          },
+          'missing room details'
+        );
+        return;
+      }
+
+      const created = await runtime.createComponent({
+        id: asUUID(uuidv4()),
         agentId: runtime.agentId,
         worldId: roomDetails.worldId,
         roomId: message.roomId,
         sourceEntityId: message.entityId,
-        entityId: entityId,
+        entityId,
         type: COMPONENT_TYPE_CHARACTER,
-        data: {
-        },
+        data: {},
         createdAt: Date.now(),
       });
-      if (!res) {
-        runtime.logger.warn('failed to create component for character, aborting modeling')
-        return
+      if (!created) {
+        runtime.logger.warn(
+          {
+            scope: LOG_SCOPE,
+            entityId,
+            roomId: message.roomId,
+          },
+          'failed to create character component'
+        );
+        return;
       }
-      // reget components
       entity = await runtime.getEntityById(entityId);
-      characterComp = entity.components.find(c => c.type === COMPONENT_TYPE_CHARACTER)
+      characterComp = entity?.components?.find(
+        (component) => component.type === COMPONENT_TYPE_CHARACTER
+      );
+      if (!characterComp) {
+        runtime.logger.error(
+          {
+            scope: LOG_SCOPE,
+            entityId,
+          },
+          'unable to fetch character component after creation'
+        );
+        return;
+      }
     }
-    /*
-    characterComp {
-      id: "336fd005-46fc-4e9d-8076-5fc20d2c291e",
-      entityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      agentId: "479233fd-b0e7-0f50-9d88-d4c9ea5b0de0",
-      roomId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      worldId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      sourceEntityId: "1f3ce254-94a7-03fb-8b73-833c6e4542fb",
-      type: "CHARACTER",
-      data: {},
-      createdAt: 1760567005000,
-    }
-    */
-    //console.log('modeler - characterComp', characterComp)
-    // adjust this character accordingly...
-    // describe current character
-    // ask about interaction to propose changes
 
-    const character = characterComp.data ?? {}
+    const character = asCharacterMetadata(characterComp.data);
 
-    //state = await runtime.composeState(message, ['RECENT_MESSAGES']);
-    //console.log('state', state)
+    const activeState: State =
+      state ?? (await runtime.composeState(message, ['RECENT_MESSAGES', 'RECENT_MEMORIES']));
 
-    const conversationLength = runtime.getConversationLength(); // defaults to 32
-    const entitiesData = await getEntityDetails({ runtime, roomId })
+    const conversationLength = runtime.getConversationLength();
+    const entitiesData = await getEntityDetails({ runtime, roomId });
     const recentMessagesData = await runtime.getMemories({
       tableName: 'messages',
       roomId: message.roomId,
       count: conversationLength,
       unique: false,
-    })
+    });
+
     const dialogueMessages = recentMessagesData.filter(
       (msg) => !(msg.content?.type === 'action_result' && msg.metadata?.type === 'action_result')
     );
     const formattedRecentMessages = await formatMessages({
       messages: dialogueMessages,
       entities: entitiesData,
-    })
+    });
 
-    const characterDescription = schemaToPrompt(characterSchema)
+    const characterDescription = schemaToPrompt(characterSchema);
     const template = `
 <task>Review existing character file for ${modelTarget} with recent conversation and see if we need to make any updates</task>
 
@@ -303,66 +344,115 @@ Respond using XML format like this:
     </update>
     <!-- Add more updates as needed -->
   </updates>
+  <userResponse>Based on updated character data, what do we estimate ${modelTarget} will respond to what {{agentName}} said last?</userResponse>
+  <userResponseReason>Your thought why</userResponseReason>
+  <userResponseConfidence>0-100 of how confidence you are about this estimation</userResponseConfidence>
+  <userResponseMissingInfo>What would you really like to know to tighten up this guess?</userResponseMissingInfo>
 </response>
 
 IMPORTANT: Your response must ONLY contain the <response></response> XML block above. Do not include any text, thinking, or reasoning before or after this XML block. Start your response immediately with <response> and end with </response>.
-</output>`
-    console.log('template', template)
+</output>`;
+    runtime.logger.debug({ scope: LOG_SCOPE }, 'prompt template created');
     const prompt = composePromptFromState({
-      state,
+      state: activeState,
       template,
     });
 
     const response = await askLlmObjectXml(runtime, {
       prompt,
     }, ['updates'])
-    if (!response || !response.updates.update) {
-      runtime.logger.warn('failed to extract updates for character, aborting modeling')
-      return
+    if (!response?.updates?.update) {
+      runtime.logger.warn(
+        {
+          scope: LOG_SCOPE,
+          response,
+        },
+        'missing updates in LLM response'
+      );
+      return;
     }
 
-    function doUpdate(u) {
-      console.log('modeler u', u)
-      // skip if confidence less than 50?
-      const old = character[u.field] ?? ''
-      if (u.old === old || (u.old === '[]' && !old)) {
-        console.log('old matches for', u.field)
-      } else {
-        console.log('old doesnt match', u.field, u.old, old)
+    const applyUpdate = (update: CharacterUpdate) => {
+      const field = update.field;
+      if (!field) {
+        runtime.logger.debug({ scope: LOG_SCOPE, update }, 'update missing field');
+        return;
       }
-      // logging delta might really help in logging
-      // should we store confidence/weight values?
-      // attempt JSON5 parse of u.new
-      let obj
-      try {
-        obj = JSON5.parse(u.new)
-        console.log('modeler - parsed', obj)
-      } catch (e) {
-        console.log('modeler - not json', u.new, e)
-        obj = undefined
-      }
-      character[u.field] = obj ?? u.new
-      // check to see if it passes the zod check?
-      // revert to old if not...?
-    }
 
-    // make changes
-    if (Array.isArray(response.updates.update)) {
-      console.log('modeler - updates', response.updates.update.length)
-      for (const u of response.updates.update) {
-        doUpdate(u)
+      const currentValue = character[field];
+      const expectedOld = update.old;
+      if (expectedOld !== undefined && expectedOld !== currentValue) {
+        runtime.logger.debug(
+          {
+            scope: LOG_SCOPE,
+            field,
+            expectedOld,
+            currentValue,
+          },
+          'update old value mismatch'
+        );
       }
-    } else if (response.updates.update) {
-      // process single?
-      console.log('modeler - single', response.updates)
-      doUpdate(response.updates.update)
+
+      const next = update.new;
+      if (typeof next !== 'string') {
+        runtime.logger.debug(
+          {
+            scope: LOG_SCOPE,
+            field,
+            next,
+          },
+          'update new value not string'
+        );
+        return;
+      }
+
+      let parsedValue: unknown = next;
+      const trimmed = next.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          parsedValue = JSON5.parse(next);
+        } catch (error) {
+          runtime.logger.debug(
+            {
+              scope: LOG_SCOPE,
+              field,
+              error,
+            },
+            'failed to parse JSON-like value'
+          );
+        }
+      }
+
+      character[field] = parsedValue;
+    };
+
+    const updates = response.updates.update;
+    if (Array.isArray(updates)) {
+      for (const update of updates) {
+        applyUpdate(update);
+      }
     } else {
-      console.log('modeler - no update?', response.updates)
+      applyUpdate(updates);
     }
-    character.name = modelTarget
-    character.id = stringToUuid(character.name)
-    console.log('modeler - new character', character)
-    // save back to our entity component
+
+    character.name = modelTarget;
+    if (typeof character.name === 'string' && character.name.length > 0) {
+      try {
+        character.id = stringToUuid(character.name);
+      } catch (error) {
+        runtime.logger.warn(
+          {
+            scope: LOG_SCOPE,
+            name: character.name,
+            error,
+          },
+          'failed to compute character id'
+        );
+      }
+    }
+
+    runtime.logger.debug({ scope: LOG_SCOPE, character }, 'updated character');
+
     await runtime.updateComponent({
       id: characterComp.id,
       entityId: characterComp.entityId,
